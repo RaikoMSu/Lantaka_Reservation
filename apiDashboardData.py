@@ -1,7 +1,7 @@
 from flask import Blueprint, jsonify, request, make_response
 from datetime import datetime, timedelta, date
 from sqlalchemy import cast, Date, func, and_, or_, extract
-from model import db, RoomReservation, VenueReservation, Room, RoomType, Receipt, GuestDetails
+from model import db, RoomReservation, VenueReservation, Room, RoomType, Receipt, GuestDetails, Venue
 import pandas as pd
 from io import BytesIO
 from reportlab.lib import colors
@@ -49,6 +49,38 @@ def get_date_range_filter(start_date, end_date, date_column):
         cast(date_column, Date) <= end_date
     )
 
+def get_available_spaces(start_date, end_date):
+    """Calculate available spaces considering ready status only."""
+    # Get total rooms and venues that are ready
+    total_rooms = db.session.query(func.count(Room.room_id))\
+        .filter(Room.room_status == 'ready')\
+        .scalar() or 0
+    
+    total_venues = db.session.query(func.count(Venue.venue_id))\
+        .filter(Venue.venue_status == 'ready')\
+        .scalar() or 0
+    
+    # Get occupied rooms and venues in date range
+    occupied_rooms = db.session.query(func.count(RoomReservation.room_id))\
+        .join(Room)\
+        .filter(
+            and_(
+                Room.room_status == 'ready',
+                get_date_range_filter(start_date, end_date, RoomReservation.room_reservation_booking_date_start)
+            )
+        ).scalar() or 0
+    
+    occupied_venues = db.session.query(func.count(VenueReservation.venue_id))\
+        .join(Venue)\
+        .filter(
+            and_(
+                Venue.venue_status == 'ready',
+                get_date_range_filter(start_date, end_date, VenueReservation.venue_reservation_booking_date_start)
+            )
+        ).scalar() or 0
+    
+    return (total_rooms - occupied_rooms) + (total_venues - occupied_venues)
+
 def reset_date_range(start_date, end_date, view_mode):
     """Reset date range based on view mode."""
     if view_mode == 'monthly':
@@ -56,8 +88,8 @@ def reset_date_range(start_date, end_date, view_mode):
         start_date = start_date.replace(day=1)
         _, last_day = monthrange(end_date.year, end_date.month)
         end_date = end_date.replace(day=last_day)
-    elif view_mode == 'daily':
-        # Reset to show current day and the last 7 days
+    else:
+        # For daily view, show last 7 days
         end_date = date.today()
         start_date = end_date - timedelta(days=6)
     return start_date, end_date
@@ -68,7 +100,7 @@ def get_dashboard_data():
         # Parse and validate input parameters
         end_date_str = request.args.get('endDate')
         start_date_str = request.args.get('startDate')
-        view_mode = request.args.get('viewMode', 'daily')
+        view_mode = request.args.get('viewMode', 'monthly')
         export_format = request.args.get('export')
 
         try:
@@ -86,21 +118,17 @@ def get_dashboard_data():
         logger.info(f"Processing request - Start Date: {start_date}, End Date: {end_date}, View Mode: {view_mode}")
 
         # Query reservations with optimized date filtering
-        room_reservations = RoomReservation.query.filter(
-            or_(
-                and_(
-                    get_date_range_filter(start_date, end_date, RoomReservation.room_reservation_booking_date_start),
-                    get_date_range_filter(start_date, end_date, RoomReservation.room_reservation_booking_date_end)
-                )
+        room_reservations = RoomReservation.query.join(Room).filter(
+            and_(
+                Room.room_status == 'ready',
+                get_date_range_filter(start_date, end_date, RoomReservation.room_reservation_booking_date_start)
             )
         ).all()
 
-        venue_reservations = VenueReservation.query.filter(
-            or_(
-                and_(
-                    get_date_range_filter(start_date, end_date, VenueReservation.venue_reservation_booking_date_start),
-                    get_date_range_filter(start_date, end_date, VenueReservation.venue_reservation_booking_date_end)
-                )
+        venue_reservations = VenueReservation.query.join(Venue).filter(
+            and_(
+                Venue.venue_status == 'ready',
+                get_date_range_filter(start_date, end_date, VenueReservation.venue_reservation_booking_date_start)
             )
         ).all()
 
@@ -112,18 +140,27 @@ def get_dashboard_data():
             get_date_range_filter(start_date, end_date, Receipt.receipt_date)
         ).scalar() or 0
 
+        # Calculate available spaces
+        current_available_spaces = get_available_spaces(start_date, end_date)
+
         # Calculate previous period
         period_length = (end_date - start_date).days + 1
         prev_end_date = start_date - timedelta(days=1)
         prev_start_date = prev_end_date - timedelta(days=period_length - 1)
 
-        # Previous period metrics with aligned date ranges
-        prev_room_reservations = RoomReservation.query.filter(
-            get_date_range_filter(prev_start_date, prev_end_date, RoomReservation.room_reservation_booking_date_start)
+        # Previous period metrics
+        prev_room_reservations = RoomReservation.query.join(Room).filter(
+            and_(
+                Room.room_status == 'ready',
+                get_date_range_filter(prev_start_date, prev_end_date, RoomReservation.room_reservation_booking_date_start)
+            )
         ).all()
 
-        prev_venue_reservations = VenueReservation.query.filter(
-            get_date_range_filter(prev_start_date, prev_end_date, VenueReservation.venue_reservation_booking_date_start)
+        prev_venue_reservations = VenueReservation.query.join(Venue).filter(
+            and_(
+                Venue.venue_status == 'ready',
+                get_date_range_filter(prev_start_date, prev_end_date, VenueReservation.venue_reservation_booking_date_start)
+            )
         ).all()
 
         prev_bookings = len(prev_room_reservations) + len(prev_venue_reservations)
@@ -133,7 +170,9 @@ def get_dashboard_data():
             get_date_range_filter(prev_start_date, prev_end_date, Receipt.receipt_date)
         ).scalar() or 0
 
-        # Generate time series data with aligned dates
+        prev_available_spaces = get_available_spaces(prev_start_date, prev_end_date)
+
+        # Generate time series data
         dates = []
         if view_mode == 'monthly':
             current_date = start_date
@@ -146,7 +185,7 @@ def get_dashboard_data():
         else:
             dates = [start_date + timedelta(days=x) for x in range((end_date - start_date).days + 1)]
 
-        # Prepare time series data with consistent formatting
+        # Prepare time series data
         occupancy_data = []
         revenue_data = []
 
@@ -154,13 +193,15 @@ def get_dashboard_data():
             if view_mode == 'monthly':
                 month_start, month_end = get_month_range(current_date)
                 
-                # Monthly metrics with consistent date ranges
-                occupied_count = db.session.query(func.count(RoomReservation.room_id)).filter(
-                    and_(
-                        cast(RoomReservation.room_reservation_booking_date_start, Date) <= month_end,
-                        cast(RoomReservation.room_reservation_booking_date_end, Date) >= month_start
-                    )
-                ).scalar() or 0
+                occupied_count = db.session.query(func.count(RoomReservation.room_id))\
+                    .join(Room)\
+                    .filter(
+                        and_(
+                            Room.room_status == 'ready',
+                            cast(RoomReservation.room_reservation_booking_date_start, Date) <= month_end,
+                            cast(RoomReservation.room_reservation_booking_date_end, Date) >= month_start
+                        )
+                    ).scalar() or 0
 
                 monthly_revenue = db.session.query(
                     func.sum(Receipt.receipt_total_amount)
@@ -183,13 +224,15 @@ def get_dashboard_data():
                     "revenue": float(monthly_revenue)
                 })
             else:
-                # Daily metrics with consistent date format
-                occupied_count = db.session.query(func.count(RoomReservation.room_id)).filter(
-                    and_(
-                        cast(RoomReservation.room_reservation_booking_date_start, Date) <= current_date,
-                        cast(RoomReservation.room_reservation_booking_date_end, Date) >= current_date
-                    )
-                ).scalar() or 0
+                occupied_count = db.session.query(func.count(RoomReservation.room_id))\
+                    .join(Room)\
+                    .filter(
+                        and_(
+                            Room.room_status == 'ready',
+                            cast(RoomReservation.room_reservation_booking_date_start, Date) <= current_date,
+                            cast(RoomReservation.room_reservation_booking_date_end, Date) >= current_date
+                        )
+                    ).scalar() or 0
 
                 daily_revenue = db.session.query(
                     func.sum(Receipt.receipt_total_amount)
@@ -224,7 +267,10 @@ def get_dashboard_data():
         ).join(
             RoomReservation, Room.room_id == RoomReservation.room_id
         ).filter(
-            get_date_range_filter(start_date, end_date, RoomReservation.room_reservation_booking_date_start)
+            and_(
+                Room.room_status == 'ready',
+                get_date_range_filter(start_date, end_date, RoomReservation.room_reservation_booking_date_start)
+            )
         ).group_by(RoomType.room_type_name).all()
 
         room_type_data = [
@@ -236,29 +282,21 @@ def get_dashboard_data():
             for row in room_type_performance
         ]
 
-        # Visitor data with specific colors
+        # Visitor data
         visitor_data = [
             {
                 "name": "Room Guests",
-                "visitors": len(room_reservations),
+                "visitors": len(room_reservations)
             },
             {
                 "name": "Venue Visitors",
-                "visitors": len(venue_reservations),
+                "visitors": len(venue_reservations)
             }
         ]
 
         total_visitors = len(room_reservations) + len(venue_reservations)
         prev_total_visitors = len(prev_room_reservations) + len(prev_venue_reservations)
         visitor_trending = calculate_percentage_change(total_visitors, prev_total_visitors)
-
-        # Room availability calculations
-        total_rooms = db.session.query(func.count(Room.room_id)).scalar() or 0
-        occupied_rooms = db.session.query(func.count(RoomReservation.room_id)).filter(
-            get_date_range_filter(start_date, end_date, RoomReservation.room_reservation_booking_date_start)
-        ).scalar() or 0
-        
-        available_rooms = total_rooms - occupied_rooms
 
         # Guest metrics
         total_guests = db.session.query(
@@ -270,15 +308,6 @@ def get_dashboard_data():
             )
         ).scalar() or 0
 
-        # Previous period calculations
-        prev_occupied_rooms = db.session.query(
-            func.count(RoomReservation.room_id)
-        ).filter(
-            get_date_range_filter(prev_start_date, prev_end_date, RoomReservation.room_reservation_booking_date_start)
-        ).scalar() or 0
-        
-        prev_available_rooms = total_rooms - prev_occupied_rooms
-        
         prev_total_guests = db.session.query(
             func.count(func.distinct(GuestDetails.guest_id))
         ).filter(
@@ -301,8 +330,8 @@ def get_dashboard_data():
             "roomTypePerformance": room_type_data,
             "visitorData": visitor_data,
             "visitorTrending": round(visitor_trending, 1),
-            "availableRooms": available_rooms,
-            "availableRoomsChange": round(calculate_percentage_change(available_rooms, prev_available_rooms), 1),
+            "availableSpaces": current_available_spaces,
+            "availableSpacesChange": round(calculate_percentage_change(current_available_spaces, prev_available_spaces), 1),
             "totalGuests": total_guests,
             "totalGuestsChange": round(calculate_percentage_change(total_guests, prev_total_guests), 1)
         }
@@ -346,21 +375,21 @@ def export_excel(dashboard_data, occupancy_data, revenue_data, room_type_data, v
                 'Metric': [
                     'Total Bookings',
                     'Total Revenue',
-                    'Available Rooms',
+                    'Available Spaces',
                     'Total Guests',
                     'Visitor Trend'
                 ],
                 'Current Value': [
                     dashboard_data['totalBookings'],
                     format_currency(dashboard_data['totalRevenue']),
-                    dashboard_data['availableRooms'],
+                    dashboard_data['availableSpaces'],
                     dashboard_data['totalGuests'],
                     f"{dashboard_data['visitorTrending']}%"
                 ],
                 'Change': [
                     f"{dashboard_data['totalBookingsChange']}%",
                     f"{dashboard_data['totalRevenueChange']}%",
-                    f"{dashboard_data['availableRoomsChange']}%",
+                    f"{dashboard_data['availableSpacesChange']}%",
                     f"{dashboard_data['totalGuestsChange']}%",
                     "N/A"
                 ]
@@ -386,7 +415,7 @@ def export_excel(dashboard_data, occupancy_data, revenue_data, room_type_data, v
             room_perf_df.columns = ['Room Type', 'Booking Frequency', 'Average Stay Duration (Days)']
             room_perf_df.to_excel(writer, sheet_name='Room Performance', index=False)
 
-            # Visitors sheet with colors
+            # Visitors sheet
             visitors_df = pd.DataFrame(visitor_data)
             visitors_df.to_excel(writer, sheet_name='Visitors', index=False)
 
@@ -405,16 +434,17 @@ def export_excel(dashboard_data, occupancy_data, revenue_data, room_type_data, v
         return jsonify({"error": "Failed to generate Excel report"}), 500
 
 def export_pdf(dashboard_data):
-    """Generate PDF report with charts."""
+    """Generate enhanced PDF report with tables and charts."""
     try:
-        import matplotlib.pyplot as plt
-        import seaborn as sns
-        from matplotlib.dates import DateFormatter
-        import pandas as pd
-        from datetime import datetime
-
         buffer = BytesIO()
-        doc = SimpleDocTemplate(buffer, pagesize=landscape(letter), rightMargin=30, leftMargin=30, topMargin=30, bottomMargin=30)
+        doc = SimpleDocTemplate(
+            buffer,
+            pagesize=letter,
+            rightMargin=30,
+            leftMargin=30,
+            topMargin=30,
+            bottomMargin=30
+        )
         elements = []
 
         # Styles
@@ -423,40 +453,51 @@ def export_pdf(dashboard_data):
             'CustomTitle',
             parent=styles['Title'],
             fontSize=24,
-            spaceAfter=30
-        )
-        subtitle_style = ParagraphStyle(
-            'CustomSubtitle',
-            parent=styles['Normal'],
-            fontSize=12,
-            textColor=colors.gray
+            spaceAfter=30,
+            textColor=colors.HexColor('#1a365d')
         )
         header_style = ParagraphStyle(
             'CustomHeader',
+            parent=styles['Heading1'],
+            fontSize=18,
+            spaceAfter=20,
+            textColor=colors.HexColor('#2c5282')
+        )
+        subheader_style = ParagraphStyle(
+            'CustomSubHeader',
             parent=styles['Heading2'],
             fontSize=14,
+            spaceAfter=10,
+            textColor=colors.HexColor('#4a5568')
+        )
+        body_style = ParagraphStyle(
+            'CustomBody',
+            parent=styles['Normal'],
+            fontSize=10,
+            leading=14,
             spaceAfter=12
         )
 
-        # Title and timestamp
-        elements.append(Paragraph("Dashboard Report", title_style))
-        elements.append(Paragraph(f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", subtitle_style))
+        # Title and Date
+        elements.append(Paragraph("Hotel Performance Dashboard Report", title_style))
+        elements.append(Paragraph(f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", subheader_style))
         elements.append(Spacer(1, 20))
 
-        # Summary table
-        elements.append(Paragraph("Summary Metrics", header_style))
+        # Summary Table
+        elements.append(Paragraph("Performance Summary", header_style))
         
         summary_data = [
-            ['Metric', 'Current Value', 'Change vs Previous Period'],
+            ['Metric', 'Current Value', 'Change'],
             ['Total Bookings', str(dashboard_data['totalBookings']), f"{dashboard_data['totalBookingsChange']}%"],
             ['Total Revenue', format_currency(dashboard_data['totalRevenue']), f"{dashboard_data['totalRevenueChange']}%"],
-            ['Available Rooms', str(dashboard_data['availableRooms']), f"{dashboard_data['availableRoomsChange']}%"],
-            ['Total Guests', str(dashboard_data['totalGuests']), f"{dashboard_data['totalGuestsChange']}%"],
+            ['Available Spaces', str(dashboard_data['availableSpaces']), f"{dashboard_data['availableSpacesChange']}%"],
+            ['Total Guests', str(dashboard_data['totalGuests']), f"{dashboard_data['totalGuestsChange']}%"]
         ]
 
-        table_style = TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#4B5563')),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+        summary_table = Table(summary_data, colWidths=[200, 150, 100])
+        summary_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1a365d')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
             ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
             ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
             ('FONTSIZE', (0, 0), (-1, 0), 12),
@@ -466,91 +507,168 @@ def export_pdf(dashboard_data):
             ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
             ('FONTSIZE', (0, 1), (-1, -1), 10),
             ('GRID', (0, 0), (-1, -1), 1, colors.black),
-            ('ROWHEIGHT', (0, 0), (-1, -1), 25)
-        ])
-
-        summary_table = Table(summary_data, colWidths=[2.5*inch, 2.5*inch, 2.5*inch])
-        summary_table.setStyle(table_style)
+            ('BOX', (0, 0), (-1, -1), 2, colors.black),
+            ('LINEBELOW', (0, 0), (-1, 0), 2, colors.black),
+        ]))
         elements.append(summary_table)
-        elements.append(Spacer(1, 20))
+        elements.append(Spacer(1, 30))
 
-        # Create charts
-        # 1. Occupancy Chart
+        # Occupancy Chart
         elements.append(Paragraph("Occupancy Trends", header_style))
-        plt.figure(figsize=(10, 4))
-        occupancy_df = pd.DataFrame(dashboard_data['occupancyData'])
-        occupancy_df['date'] = pd.to_datetime(occupancy_df['date'])
-        plt.plot(occupancy_df['date'], occupancy_df['occupancy'], marker='o')
-        plt.title('Room Occupancy Over Time')
-        plt.xlabel('Date')
-        plt.ylabel('Occupancy')
-        plt.grid(True)
-        plt.xticks(rotation=45)
+        elements.append(Paragraph("""
+            This graph illustrates the monthly occupancy trends of our facilities. The data demonstrates 
+            the utilization of our spaces over time, providing insights into seasonal patterns and overall 
+            demand fluctuations.
+        """, body_style))
         
-        # Save chart to memory
-        img_buffer = BytesIO()
-        plt.savefig(img_buffer, format='png', bbox_inches='tight')
-        img_buffer.seek(0)
-        elements.append(Image(img_buffer, width=7*inch, height=3*inch))
-        elements.append(Spacer(1, 20))
+        plt.figure(figsize=(10, 6))
+        occupancy_data = dashboard_data['occupancyData']
+        
+        dates = [d['date'] for d in occupancy_data]
+        occupancy = [d['occupancy'] for d in occupancy_data]
+        
+        plt.bar(dates, occupancy, color='#3B82F6')
+        plt.title('Monthly Occupancy')
+        plt.xlabel('Month')
+        plt.ylabel('Occupancy Count')
+        plt.xticks(rotation=45)
+        plt.grid(True, axis='y', linestyle='--', alpha=0.7)
+        
+        occupancy_buffer = BytesIO()
+        plt.savefig(occupancy_buffer, format='png', bbox_inches='tight', dpi=300)
+        occupancy_buffer.seek(0)
+        elements.append(Image(occupancy_buffer, width=7*inch, height=4*inch))
         plt.close()
 
-        # 2. Revenue Chart
+        elements.append(Spacer(1, 20))
+
+        # Revenue Chart
         elements.append(Paragraph("Revenue Analysis", header_style))
-        plt.figure(figsize=(10, 4))
-        revenue_df = pd.DataFrame(dashboard_data['revenueData'])
-        revenue_df['date'] = pd.to_datetime(revenue_df['date'])
-        plt.plot(revenue_df['date'], revenue_df['revenue'], marker='o', color='green')
+        elements.append(Paragraph("""
+            This graph presents our revenue performance over time. The curve demonstrates the financial 
+            trajectory of our operations, allowing us to identify trends, peak periods, and areas for 
+            potential growth or improvement in our revenue management strategies.
+        """, body_style))
+        
+        plt.figure(figsize=(10, 6))
+        revenue_data = dashboard_data['revenueData']
+        
+        dates = [d['date'] for d in revenue_data]
+        revenue = [d['revenue'] for d in revenue_data]
+        
+        plt.plot(dates, revenue, color='#3B82F6', linewidth=2)
+        plt.fill_between(dates, revenue, alpha=0.2, color='#3B82F6')
         plt.title('Revenue Trends')
-        plt.xlabel('Date')
-        plt.ylabel('Revenue (PHP)')
-        plt.grid(True)
+        plt.xlabel('Month')
+        plt.ylabel('Revenue (₱)')
         plt.xticks(rotation=45)
+        plt.grid(True, linestyle='--', alpha=0.7)
         
-        img_buffer = BytesIO()
-        plt.savefig(img_buffer, format='png', bbox_inches='tight')
-        img_buffer.seek(0)
-        elements.append(Image(img_buffer, width=7*inch, height=3*inch))
-        elements.append(Spacer(1, 20))
+        # Format y-axis as currency
+        plt.gca().yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'₱{x:,.0f}'))
+        
+        revenue_buffer = BytesIO()
+        plt.savefig(revenue_buffer, format='png', bbox_inches='tight', dpi=300)
+        revenue_buffer.seek(0)
+        elements.append(Image(revenue_buffer, width=7*inch, height=4*inch))
         plt.close()
 
-        # 3. Visitor Distribution Pie Chart
-        elements.append(Paragraph("Visitor Distribution", header_style))
+        elements.append(Spacer(1, 20))
+
+        # Visitor Distribution Chart
+        elements.append(Paragraph("Visitor Distribution Analysis", header_style))
+        elements.append(Paragraph(f"""
+            This chart illustrates the distribution of visitors between room guests and venue visitors. 
+            It provides a clear visualization of our customer segmentation, helping us understand the 
+            balance between different types of visitors and inform our marketing and operational strategies.
+        """, body_style))
+        
         plt.figure(figsize=(8, 8))
-        visitor_df = pd.DataFrame(dashboard_data['visitorData'])
-        plt.pie(visitor_df['visitors'], labels=visitor_df['name'], autopct='%1.1f%%')
-        plt.title('Distribution of Visitors')
+        visitor_data = dashboard_data['visitorData']
+        visitors = [d['visitors'] for d in visitor_data]
+        labels = [d['name'] for d in visitor_data]
+        colors_pie = ['#60A5FA', '#3B82F6']
         
-        img_buffer = BytesIO()
-        plt.savefig(img_buffer, format='png', bbox_inches='tight')
-        img_buffer.seek(0)
-        elements.append(Image(img_buffer, width=5*inch, height=5*inch))
-        elements.append(Spacer(1, 20))
+        plt.pie(visitors,
+                labels=labels,
+                colors=colors_pie,
+                autopct='%1.1f%%',
+                startangle=90)
+        plt.title('Room vs Venue Visitors')
+        
+        # Add total visitors in center
+        total_visitors = sum(visitors)
+        plt.text(0, 0, f'{total_visitors}\nTotal Visitors',
+                ha='center', va='center',
+                fontsize=12, fontweight='bold')
+        
+        visitor_buffer = BytesIO()
+        plt.savefig(visitor_buffer, format='png', bbox_inches='tight', dpi=300)
+        visitor_buffer.seek(0)
+        elements.append(Image(visitor_buffer, width=4*inch, height=4*inch))
         plt.close()
 
-        # 4. Room Type Performance
+        elements.append(Spacer(1, 20))
+
+        # Room Type Performance Chart
         elements.append(Paragraph("Room Type Performance", header_style))
-        room_perf_df = pd.DataFrame(dashboard_data['roomTypePerformance'])
+        elements.append(Paragraph("""
+            This combined chart displays both booking frequency and average stay duration for each room type. 
+            The bars represent the number of bookings, while the line shows the average length of stay. 
+            This visualization helps identify our most popular room types and understand guest preferences 
+            in terms of stay duration, enabling better inventory management and pricing strategies.
+        """, body_style))
         
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+        plt.figure(figsize=(10, 6))
+        room_data = dashboard_data['roomTypePerformance']
         
-        # Booking Frequency
-        sns.barplot(data=room_perf_df, x='roomType', y='bookingFrequency', ax=ax1)
-        ax1.set_title('Booking Frequency by Room Type')
-        ax1.set_xticklabels(ax1.get_xticklabels(), rotation=45)
+        fig, ax1 = plt.subplots(figsize=(10, 6))
         
-        # Average Stay Duration
-        sns.barplot(data=room_perf_df, x='roomType', y='avgStayDuration', ax=ax2)
-        ax2.set_title('Average Stay Duration by Room Type')
-        ax2.set_xticklabels(ax2.get_xticklabels(), rotation=45)
+        x = range(len(room_data))
+        bars = ax1.bar(x, [d['bookingFrequency'] for d in room_data],
+                      color='#60A5FA', alpha=0.7)
+        ax1.set_ylabel('Booking Frequency', color='#60A5FA')
+        ax1.tick_params(axis='y', labelcolor='#60A5FA')
+        
+        ax2 = ax1.twinx()
+        line = ax2.plot(x, [d['avgStayDuration'] for d in room_data],
+                       color='#3B82F6', marker='o', linewidth=2,
+                       label='Avg Stay Duration')
+        ax2.set_ylabel('Average Stay Duration (days)', color='#3B82F6')
+        ax2.tick_params(axis='y', labelcolor='#3B82F6')
+        
+        plt.title('Booking Frequency and Average Stay Duration by Room Type')
+        plt.xticks(x, [d['roomType'] for d in room_data], rotation=45)
+        
+        # Add legend
+        lines_1, labels_1 = ax1.get_legend_handles_labels()
+        lines_2, labels_2 = ax2.get_legend_handles_labels()
+        ax2.legend(lines_1 + lines_2, ['Booking Frequency', 'Avg Stay Duration'],
+                  loc='upper right')
         
         plt.tight_layout()
         
-        img_buffer = BytesIO()
-        plt.savefig(img_buffer, format='png', bbox_inches='tight')
-        img_buffer.seek(0)
-        elements.append(Image(img_buffer, width=7*inch, height=3*inch))
+        performance_buffer = BytesIO()
+        plt.savefig(performance_buffer, format='png', bbox_inches='tight', dpi=300)
+        performance_buffer.seek(0)
+        elements.append(Image(performance_buffer, width=7*inch, height=4*inch))
         plt.close()
+
+        # Conclusion
+        elements.append(Paragraph("Conclusion", header_style))
+        elements.append(Paragraph(f"""
+            This report provides a comprehensive overview of our hotel's performance. Key highlights include:
+            
+            1. Total Bookings: {dashboard_data['totalBookings']} ({dashboard_data['totalBookingsChange']}% change)
+            2. Total Revenue: {format_currency(dashboard_data['totalRevenue'])} ({dashboard_data['totalRevenueChange']}% change)
+            3. Available Spaces: {dashboard_data['availableSpaces']} ({dashboard_data['availableSpacesChange']}% change)
+            4. Total Guests: {dashboard_data['totalGuests']} ({dashboard_data['totalGuestsChange']}% change)
+            5. Visitor Distribution: {round(dashboard_data['visitorData'][0]['visitors']/sum(v['visitors'] for v in dashboard_data['visitorData'])*100)}% room guests, {round(dashboard_data['visitorData'][1]['visitors']/sum(v['visitors'] for v in dashboard_data['visitorData'])*100)}% venue visitors
+            6. Visitor Trend: {dashboard_data['visitorTrending']}% increase this period
+            
+            These metrics and visualizations provide valuable insights into our operations, helping guide 
+            strategic decisions in areas such as pricing, marketing, and capacity management.
+        """, body_style))
 
         # Build PDF
         doc.build(elements)
